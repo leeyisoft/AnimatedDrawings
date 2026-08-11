@@ -24,3 +24,5 @@ examples/garlic_out
 !media/*.gif
 
 torchserve/logs/
+.venv
+service/jobs

@@ -71,8 +71,10 @@ class VideoRenderController(Controller):
             msg = f'frame time of BVH files don\'t match. Using first value: {frame_time[0]}'
             logging.warning(msg)
 
-        self.frames_left_to_render = max_frames
-        self.delta_t = frame_time[0]
+        # Downsample by 3 to achieve 3x rendering speed and 3x faster GIF compression
+        downsample_factor = 3
+        self.frames_left_to_render = max_frames // downsample_factor
+        self.delta_t = frame_time[0] * downsample_factor
 
     def _prep_for_run_loop(self) -> None:
         self.run_loop_start_time = time.time()

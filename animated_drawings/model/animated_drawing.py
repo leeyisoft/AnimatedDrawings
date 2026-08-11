@@ -433,8 +433,13 @@ class AnimatedDrawing(Transform, TimeManager):
             joint_idx = joint_name_to_idx.index(joint['name'])
             dist_joint_xy: List[float] = joint['loc']
             prox_joint_xy: List[float] = joints_d[joint['parent']]['loc']
-            seeds_xy = (self.img_dim * np.linspace(dist_joint_xy, prox_joint_xy, num=20, endpoint=False)).round()
-            heap.extend([(0, (joint_idx, tuple(seed_xy.astype(np.int32)))) for seed_xy in seeds_xy])
+            # Scale coordinates relative to self.mask shape to prevent seed positions from exceeding array boundaries
+            h_dim, w_dim = self.mask.shape
+            seeds_relative = np.linspace(dist_joint_xy, prox_joint_xy, num=20, endpoint=False)
+            for seed_rel in seeds_relative:
+                sx = int(np.clip(round(seed_rel[0] * (w_dim - 1)), 0, w_dim - 1))
+                sy = int(np.clip(round(seed_rel[1] * (h_dim - 1)), 0, h_dim - 1))
+                heap.extend([(0, (joint_idx, (sx, sy)))])
 
         # BFS search
         start_time: float = time.time()
@@ -538,14 +543,21 @@ class AnimatedDrawing(Transform, TimeManager):
             logging.critical(msg)
             assert False, msg
 
-        # if multiple distinct polygons are in the mask, use largest and discard the rest
-        if len(contours) > 1:
-            msg = f'{len(contours)} separate polygons found in mask. Using largest.'
-            logging.info(msg)
-            contours.sort(key=len, reverse=True)
+        character_outlines = []
+        all_outside_vertices = []
 
-        outside_vertices: npt.NDArray[np.float64] = measure.approximate_polygon(contours[0], tolerance=0.25)
-        character_outline = geometry.Polygon(contours[0])
+        # Keep all contours that have a length of 10 or more (to ignore tiny 1-pixel noise)
+        # This allows characters made of multiple disconnected strokes/components (like the sun rays) to be fully meshed!
+        valid_contours = [c for c in contours if len(c) >= 10]
+        if not valid_contours:
+            valid_contours = contours  # Fallback to all contours if all are very small
+
+        for c in valid_contours:
+            approx = measure.approximate_polygon(c, tolerance=0.25)
+            all_outside_vertices.append(approx)
+            character_outlines.append(geometry.Polygon(c))
+
+        outside_vertices = np.concatenate(all_outside_vertices).astype(np.float32)
 
         # add some internal vertices to ensure a good mesh is created
         inside_vertices_xy: List[Tuple[np.float32, np.float32]] = []
@@ -553,24 +565,26 @@ class AnimatedDrawing(Transform, TimeManager):
         _y = np.linspace(0, self.img_dim, 40)
         xv, yv = np.meshgrid(_x, _y)
         for x, y in zip(xv.flatten(), yv.flatten()):
-            if character_outline.contains(geometry.Point(x, y)):
+            pt = geometry.Point(x, y)
+            if any(outline.contains(pt) for outline in character_outlines):
                 inside_vertices_xy.append((x, y))
-        inside_vertices: npt.NDArray[np.float64] = np.array(inside_vertices_xy)
 
-        vertices: npt.NDArray[np.float32] = np.concatenate([outside_vertices, inside_vertices]).astype(np.float32)
+        if len(inside_vertices_xy) > 0:
+            inside_vertices = np.array(inside_vertices_xy)
+            vertices = np.concatenate([outside_vertices, inside_vertices]).astype(np.float32)
+        else:
+            vertices = outside_vertices.astype(np.float32)
 
-        """
-        Create a convex hull containing the character.
-        Then remove unnecessary edges by discarding triangles whose centroid
-        falls outside the character's outline.
-        """
+        # Create a convex hull containing the character.
+        # Then remove unnecessary edges by discarding triangles whose centroid
+        # falls outside all of the character's outlines.
         convex_hull_triangles = Delaunay(vertices)
         triangles: List[npt.NDArray[np.int32]] = []
         for _triangle in convex_hull_triangles.simplices:
             tri_vertices = np.array(
                 [vertices[_triangle[0]], vertices[_triangle[1]], vertices[_triangle[2]]])
             tri_centroid = geometry.Point(np.mean(tri_vertices, 0))
-            if character_outline.contains(tri_centroid):
+            if any(outline.contains(tri_centroid) for outline in character_outlines):
                 triangles.append(_triangle)
 
         vertices /= self.img_dim  # scale vertices so they lie between 0-1
